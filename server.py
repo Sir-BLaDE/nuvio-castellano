@@ -53,7 +53,7 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 # =====================================================
 
 ADDON_ID = "com.sirblade.nuvio-castellano"
-ADDON_VERSION = "3.2.0"
+ADDON_VERSION = "3.2.1"
 ADDON_NAME = "Castellano ES - SOLO CACHE (Nuvio)"
 ADDON_DESCRIPTION = (
     "Agrega Spanish Streams + Torrentio(ES) + Peerflix + Pipe + LatinoBox-ES "
@@ -64,6 +64,11 @@ ADDON_DESCRIPTION = (
 
 HOST = "0.0.0.0"
 PORT = 7000
+# URL publica real (Beamup reescribe el header Host a un nombre interno).
+# Se puede cambiar con la variable de entorno PUBLIC_ADDON_URL.
+PUBLIC_ADDON_URL = os.environ.get(
+    "PUBLIC_ADDON_URL", "https://806399bc52d4-nuvio-castellano.baby-beamup.club"
+).rstrip("/")
 
 ALLDEBRID_API = "https://api.alldebrid.com/v4"
 ALLDEBRID_USER_ENDPOINT = f"{ALLDEBRID_API}/user"
@@ -1072,6 +1077,20 @@ class NuvioAddonHandler(BaseHTTPRequestHandler):
                 return cfg
         return {}
 
+    def _install_url(self, cfg: Dict[str, Any]) -> str:
+        """URL instalable: siempre HTTPS publica y terminada en /manifest.json.
+
+        En local se respeta el Host (http://localhost:puerto). En hosting no se
+        usa el header Host: Beamup/Render lo reescriben a un nombre interno que
+        el cliente (Nuvio) no puede resolver ("host desconocido").
+        """
+        host = (self.headers.get("Host") or "").strip()
+        if host.startswith(("localhost", "127.0.0.1")):
+            base = f"http://{host}"
+        else:
+            base = PUBLIC_ADDON_URL
+        return f"{base}/{encode_config(cfg)}/manifest.json"
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1101,8 +1120,7 @@ class NuvioAddonHandler(BaseHTTPRequestHandler):
                     "alldebrid": key,
                     "sources": [s for s in cfg.get("sources", []) if s in SOURCES] or DEFAULT_SOURCES,
                 }
-                host = self.headers.get("Host", f"localhost:{PORT}")
-                install_url = f"http://{host}/{encode_config(clean)}/"
+                install_url = self._install_url(clean)
             self._send_json({
                 "valid": valid, "message": message, "installUrl": install_url,
             }, cache=False)
@@ -1126,6 +1144,12 @@ class NuvioAddonHandler(BaseHTTPRequestHandler):
         enabled = [s for s in cfg.get("sources", []) if s in SOURCES] or DEFAULT_SOURCES
 
         if path.endswith("/manifest.json") or path == "/manifest.json":
+            self._send_json(build_manifest())
+            return
+
+        # Algunos clientes piden el manifiesto a la URL base del config, sin
+        # /manifest.json. Aceptamos /{config} y /{config}/ por compatibilidad.
+        if re.fullmatch(r"/[^/]+/?", path) and decode_config(path.strip("/")):
             self._send_json(build_manifest())
             return
 
