@@ -19,7 +19,9 @@ FUENTES que consulta en paralelo:
 Pipeline:
   Consulta paralela -> filtro CASTELLANO (descarta latino/otros) ->
   deduplicacion por infoHash -> clasificacion detallada de calidad ->
-  orden de mejor a peor -> (opcional) conversion a enlaces directos AllDebrid
+  orden de mejor a peor -> conversion SOLO de magnets YA CACHEADOS en AllDebrid
+  (flag `ready:true` en /magnet/upload + statusCode 4) ->
+  SALIDA FINAL: unicamente streams con `url` directa. CERO P2P/magnets.
 
 Sin dependencias externas (solo Python stdlib).
 """
@@ -43,12 +45,13 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 # =====================================================
 
 ADDON_ID = "com.sirblade.nuvio-castellano"
-ADDON_VERSION = "2.0.0"
-ADDON_NAME = "Castellano ES - MultiFuente (Nuvio)"
+ADDON_VERSION = "3.0.0"
+ADDON_NAME = "Castellano ES - SOLO CACHE (Nuvio)"
 ADDON_DESCRIPTION = (
     "Agrega Spanish Streams + Torrentio(ES) + Peerflix + Pipe. "
-    "Devuelve SOLO castellano espanol (descarta latino e italiano/frances/ingles), "
-    "sin duplicados y ordenado por calidad: Remux > BluRay > WEB-DL > HDTV."
+    "SOLO castellano espanol (descarta latino/otros idiomas) y SOLO enlaces "
+    "directos YA CACHEADOS en AllDebrid: cero magnets/P2P. "
+    "Ordenados por calidad: Remux > BluRay > WEB-DL > HDTV."
 )
 
 HOST = "0.0.0.0"
@@ -64,8 +67,12 @@ ALLDEBRID_AGENT = "NuvioCastellanoAddon"
 # Calidad minima (40 = 720p). Subir a 60 para exigir 1080p+
 MIN_QUALITY_SCORE = 40
 
-# Convertir los N mejores magnets a enlaces directos de AllDebrid (0 = desactivado)
-MAX_DIRECT_LINKS = 5
+# Convertir TODOS los candidatos a enlaces directos. Solo se devuelven los que
+# AllDebrid confirma como YA cacheados (ready:true). 0 = sin limite.
+MAX_DIRECT_LINKS = 0
+
+# Numero de llamadas concurrentes a la API de AllDebrid
+MAX_AD_WORKERS = 8
 
 # Caché
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
@@ -167,6 +174,21 @@ def _cache_set(path: str, key: str, value: Any) -> None:
         if len(data) > 500:
             items = sorted(data.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)
             data = dict(items[:500])
+        _save_cache(path, data)
+
+
+def _cache_set_many(path: str, items: List[Tuple[str, Any]]) -> None:
+    """Guarda varias entradas de cache con una sola lectura/escritura de disco."""
+    if not items:
+        return
+    with _cache_lock:
+        data = _load_cache(path)
+        now = time.time()
+        for key, value in items:
+            data[key] = {"ts": now, "value": value}
+        if len(data) > 500:
+            ordered = sorted(data.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)
+            data = dict(ordered[:500])
         _save_cache(path, data)
 
 
@@ -490,8 +512,14 @@ def _ad_get(url: str, key: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _ad_upload_magnet(hash_: str, key: str) -> Optional[int]:
-    """Sube un hash a AllDebrid y devuelve el id del magnet."""
+def _ad_upload_magnet(hash_: str, key: str) -> Optional[Dict[str, Any]]:
+    """
+    Sube un hash a AllDebrid y devuelve el objeto magnet completo.
+
+    El campo `ready` de esta respuesta es la señal de CACHE:
+      ready = True  -> AllDebrid ya lo tiene, hay enlaces directos al instante.
+      ready = False -> no esta cacheado (se descarta, nunca se ofrece P2P).
+    """
     try:
         body = urllib.parse.urlencode({"magnets[]": hash_}).encode("utf-8")
         url = f"{ALLDEBRID_MAGNET_UPLOAD}?agent={ALLDEBRID_AGENT}&apikey={key}"
@@ -509,7 +537,7 @@ def _ad_upload_magnet(hash_: str, key: str) -> Optional[int]:
             data = json.loads(resp.read().decode("utf-8"))
         magnets = (data.get("data") or {}).get("magnets") or []
         if magnets and "id" in magnets[0]:
-            return magnets[0]["id"]
+            return magnets[0]
         err = data.get("error", {})
         print(f"[WARN] AllDebrid upload: {err.get('code')} {err.get('message')}")
     except Exception as e:
@@ -545,57 +573,122 @@ def _pick_direct_link(magnet_files: List[Dict[str, Any]], file_idx: Optional[int
     return filename, link
 
 
-def convert_to_direct_links(streams: List[Dict[str, Any]], key: str) -> int:
-    """Convierte los N mejores magnets en URLs directas de AllDebrid. Devuelve cuantos."""
-    if not key or MAX_DIRECT_LINKS <= 0:
-        return 0
+def _magnet_is_ready(mag: Dict[str, Any]) -> bool:
+    """AllDebrid statusCode 4 = 'Ready'. Cualquier otro estado NO es cache."""
+    try:
+        return int(mag.get("statusCode", -1)) == 4
+    except (TypeError, ValueError):
+        return str(mag.get("status", "")).lower() == "ready"
 
-    converted = 0
-    for stream in streams[:MAX_DIRECT_LINKS]:
+
+def _make_direct_stream(stream: Dict[str, Any], direct_url: str) -> Dict[str, Any]:
+    """
+    Construye el stream final SIN campos P2P.
+
+    Se crea un dict nuevo: no se copian `infoHash`, `fileIdx` ni
+    `behaviorHints.bingeGroup`. El unico campo de reproduccion es `url`.
+    """
+    name = stream.get("name", "") or "Stream"
+    if "[CACHE]" not in name:
+        name = f"{name} [CACHE]"
+    return {
+        "name": name,
+        "title": stream.get("title", "") or "",
+        "url": direct_url,
+    }
+
+
+def convert_to_direct_links(streams: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    """
+    Devuelve SOLAMENTE streams con URL directa cacheada en AllDebrid.
+
+    Descarta:
+      - streams sin key de AllDebrid,
+      - magnets que AllDebrid no marca como `ready` (no cacheados),
+      - magnets cuyo estado no sea statusCode 4,
+      - enlaces que no se pueden desbloquear.
+
+    Nunca devuelve `infoHash` ni `fileIdx`: el resultado es 100% no-P2P.
+    """
+    if not key:
+        return []
+
+    fp = _fingerprint(key)
+    targets = streams if MAX_DIRECT_LINKS <= 0 else streams[:MAX_DIRECT_LINKS]
+    results: List[Optional[Dict[str, Any]]] = [None] * len(targets)
+    new_cache: List[Tuple[str, str]] = []
+
+    def worker(idx: int, stream: Dict[str, Any]) -> None:
+        # Algunas fuentes ya entregan URL directa: la aprovechamos tal cual.
+        if stream.get("url") and not stream.get("infoHash"):
+            results[idx] = _make_direct_stream(stream, stream["url"])
+            return
+
         hash_ = stream.get("infoHash")
         if not hash_:
-            continue
-        fp = _fingerprint(key)
+            return
+
         cache_key = f"{fp}:{hash_}:{stream.get('fileIdx', 'x')}"
         cached = _cache_get(DIRECT_CACHE_FILE, cache_key, DIRECT_CACHE_TTL)
         if cached:
-            stream["url"] = cached
-            stream["name"] += " [DIRECTO]"
-            converted += 1
-            continue
+            results[idx] = _make_direct_stream(stream, cached)
+            return
 
-        magnet_id = _ad_upload_magnet(hash_, key)
-        if not magnet_id:
-            continue
+        uploaded = _ad_upload_magnet(hash_, key)
+        if not uploaded:
+            return
+        if not uploaded.get("ready"):
+            # NO cacheado: se descarta. Nunca se ofrece el magnet al usuario.
+            return
 
         status = _ad_get(
-            f"{ALLDEBRID_MAGNET_STATUS}?agent={ALLDEBRID_AGENT}&apikey={key}&id={magnet_id}", key
+            f"{ALLDEBRID_MAGNET_STATUS}?agent={ALLDEBRID_AGENT}"
+            f"&apikey={key}&id={uploaded['id']}", key
         ) or {}
         magnets = (status.get("data") or {}).get("magnets")
         if isinstance(magnets, dict):
             magnets = [magnets]
+
+        ready_magnets = [m for m in (magnets or []) if _magnet_is_ready(m)]
+        if not ready_magnets:
+            return
+
         magnet_files: List[Dict[str, Any]] = []
-        for mag in (magnets or []):
+        for mag in ready_magnets:
             files = mag.get("files") or []
             if isinstance(files, list):
                 magnet_files.extend(f for f in files if isinstance(f, dict))
         picked = _pick_direct_link(magnet_files, stream.get("fileIdx"))
         if not picked:
-            continue
+            return
 
         filename, ad_link = picked
         unlocked = _ad_get(
             f"{ALLDEBRID_LINK_UNLOCK}?agent={ALLDEBRID_AGENT}&apikey={key}"
             f"&link={urllib.parse.quote(ad_link, safe='')}", key
         ) or {}
-        direct = ((unlocked.get("data") or {}).get("link"))
+        direct = (unlocked.get("data") or {}).get("link")
         if direct:
-            stream["url"] = direct
-            stream["name"] += " [DIRECTO]"
-            _cache_set(DIRECT_CACHE_FILE, cache_key, direct)
-            converted += 1
-            print(f"[INFO] Directo generado: {filename[:60]}")
-    return converted
+            results[idx] = _make_direct_stream(stream, direct)
+            new_cache.append((cache_key, direct))
+            print(f"[INFO] CACHE directo: {filename[:60]}")
+
+    with ThreadPoolExecutor(max_workers=MAX_AD_WORKERS) as pool:
+        futures = [pool.submit(worker, i, s) for i, s in enumerate(targets)]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"[WARN] Conversion AllDebrid fallo: {e}")
+
+    _cache_set_many(DIRECT_CACHE_FILE, new_cache)
+    final = [r for r in results if r is not None]
+    # Renumerar: los que no estaban cacheados desaparecieron, no dejar huecos.
+    for rank, s in enumerate(final, 1):
+        s["name"] = re.sub(r"^#\d+", f"#{rank}", s["name"])
+    descartados = len(targets) - len(final)
+    print(f"[INFO] Cacheados: {len(final)}/{len(targets)} | descartados (P2P/no cache): {descartados}")
+    return final
 
 
 # =====================================================
@@ -618,11 +711,17 @@ def build_streams(
 
     raw, errors = fetch_all_sources(media_type, full_id, alldebrid_key, enabled_sources)
     ranked, _ = build_rankings(raw)
-    direct = convert_to_direct_links(ranked, alldebrid_key)
-    print(f"[INFO] Enlaces directos generados: {direct}/{len(ranked)}")
 
-    _cache_set(STREAM_CACHE_FILE, cache_key, ranked)
-    return ranked
+    if not alldebrid_key:
+        print("[WARN] Sin API key de AllDebrid: este addon solo sirve enlaces cacheados")
+        return []
+
+    # Unico punto de salida: se sustituye la lista P2P por solo enlaces cacheados.
+    final = convert_to_direct_links(ranked, alldebrid_key)
+    print(f"[INFO] Resultado final 100% cacheado: {len(final)} streams (de {len(ranked)} candidatos)")
+
+    _cache_set(STREAM_CACHE_FILE, cache_key, final)
+    return final
 
 
 # =====================================================
@@ -694,14 +793,16 @@ CONFIGURE_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <h1>{name}</h1>
-<p>Este addon consulta <strong>4 fuentes en paralelo</strong> y devuelve solo castellano espanol, ordenado por calidad.</p>
+<p>Este addon consulta <strong>4 fuentes en paralelo</strong>, devuelve solo castellano espanol
+y <strong style="color:#7fe3a8">exclusivamente enlaces directos YA CACHEADOS en AllDebrid</strong>.
+No se devuelve ningun magnet ni enlace P2P: si un torrent no esta en la cache de AllDebrid, se descarta.</p>
 
 <h2>Fuentes activas</h2>
 {sources}
 
-<h2>1. Clave de AllDebrid (opcional pero recomendada)</h2>
+<h2>1. Clave de AllDebrid (OBLIGATORIA)</h2>
 <p>La encuentras en <a href="https://alldebrid.com/apikeys/" target="_blank" style="color:#23CC98">alldebrid.com/apikeys</a>.
-Se valida contra la API v4 y permite generar enlaces directos.</p>
+Se valida contra la API v4. Sin clave no hay enlaces cacheados, por eso el addon no devolvera ningun stream.</p>
 <input type="text" id="apikey" placeholder="Pega aqui tu API key de AllDebrid" autocomplete="off">
 
 <h2>2. Fuentes a usar</h2>
@@ -722,11 +823,12 @@ async function guardar() {
   const msg = document.getElementById('msg');
   msg.style.display = 'block';
   if (sources.length === 0) { msg.className='err'; msg.textContent='Selecciona al menos una fuente.'; return; }
+  if (!key) { msg.className='err'; msg.textContent='La clave de AllDebrid es obligatoria (solo se sirven enlaces cacheados).'; return; }
   msg.className=''; msg.textContent='Validando...';
 
   const cfg = { alldebrid: key, sources: sources };
   try {
-    const resp = await fetch('/configure?make=' + encodeURIComponent(JSON.stringify(cfg)) + (key ? '&validate=1' : ''));
+    const resp = await fetch('/configure?make=' + encodeURIComponent(JSON.stringify(cfg)) + '&validate=1');
     const data = await resp.json();
     if (data.valid) {
       msg.className='ok'; msg.textContent = data.message || 'Configuracion lista';
@@ -862,6 +964,9 @@ class NuvioAddonHandler(BaseHTTPRequestHandler):
         m = re.match(r"^(?:/[^/]+)?/stream/(movie|series)/([^/]+?)\.json$", path)
         if m:
             media_type, raw_id = m.group(1), m.group(2)
+            # Nuvio/Stremio envian los dos puntos de series codificados (%3A).
+            # Sin decodificar, las fuentes reciben un ID invalido y devuelven 0.
+            raw_id = urllib.parse.unquote(raw_id)
             print(f"[INFO] Stream {media_type} {raw_id} | fuentes={enabled}")
             streams = build_streams(media_type, raw_id, alldebrid_key, enabled)
             self._send_json({"streams": streams})
