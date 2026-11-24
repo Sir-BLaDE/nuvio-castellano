@@ -15,6 +15,10 @@ FUENTES que consulta en paralelo:
   2. Torrentio (proveedores es: MejorTorrent, Cinecalidad, Wolfmax4k, ...)
   3. Peerflix         - la que ya tienes instalada
   4. Pipe             - scraping adicional de indices
+  5. LatinoBox-ES     - configurado con langMode=only_castellano
+
+DeepFlix se descarto: devuelve un enlace directo propio (no cache AllDebrid)
+y marca el idioma como "🇪🇸?" (ambiguo), por lo que no cumple el modo estricto.
 
 Pipeline:
   Consulta paralela -> filtro CASTELLANO (descarta latino/otros) ->
@@ -45,10 +49,10 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 # =====================================================
 
 ADDON_ID = "com.sirblade.nuvio-castellano"
-ADDON_VERSION = "3.0.0"
+ADDON_VERSION = "3.1.0"
 ADDON_NAME = "Castellano ES - SOLO CACHE (Nuvio)"
 ADDON_DESCRIPTION = (
-    "Agrega Spanish Streams + Torrentio(ES) + Peerflix + Pipe. "
+    "Agrega Spanish Streams + Torrentio(ES) + Peerflix + Pipe + LatinoBox-ES. "
     "SOLO castellano espanol (descarta latino/otros idiomas) y SOLO enlaces "
     "directos YA CACHEADOS en AllDebrid: cero magnets/P2P. "
     "Ordenados por calidad: Remux > BluRay > WEB-DL > HDTV."
@@ -93,6 +97,21 @@ TORRENTIO_PROVIDERS = (
     "yts,1337x,tpb,rarbg,eztv,torrentgalaxy,magnetdl,kickasstorrents"
 )
 
+def _latinobox_config(lang_mode: str = "only_castellano") -> str:
+    """Config base64url de LatinoBox forzando SOLO castellano."""
+    cfg = {
+        "userKey": "usr_p2p_70a86304bc23e0226f7",
+        "torboxApiKey": "",
+        "resolutions": ["2160p", "1080p", "720p", "480p"],
+        "maxSizeGB": 120,
+        "allowCam": False,
+        "onlyCached": False,
+        "langMode": lang_mode,
+    }
+    raw = json.dumps(cfg, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
 SOURCES: Dict[str, Dict[str, Any]] = {
     "spanishstreams": {
         "label": "SpanishStreams",
@@ -124,6 +143,13 @@ SOURCES: Dict[str, Dict[str, Any]] = {
         "label": "Pipe",
         "build": lambda t, i, k: (
             f"https://pipe.boringways.workers.dev"
+            f"/stream/{t}/{urllib.parse.quote(i, safe=':')}.json"
+        ),
+    },
+    "latinobox": {
+        "label": "LatinoBox-ES",
+        "build": lambda t, i, k: (
+            f"https://latinobox.daleplay.biz/c/{_latinobox_config()}"
             f"/stream/{t}/{urllib.parse.quote(i, safe=':')}.json"
         ),
     },
@@ -235,13 +261,14 @@ def classify_language(stream: Dict[str, Any]) -> str:
     """
     title = stream.get("title", "") or ""
     name = stream.get("name", "") or ""
+    desc = stream.get("description", "") or ""   # DeepFlix usa 'description'
     group = ""
     try:
         group = stream.get("behaviorHints", {}).get("bingeGroup", "") or ""
     except Exception:
         pass
 
-    text = f"{title} {name} {group}".lower()
+    text = f"{title} {desc} {name} {group}".lower()
     group_lower = group.lower()
 
     # 1) Fuente que etiqueta explicitamente
@@ -254,6 +281,10 @@ def classify_language(stream: Dict[str, Any]) -> str:
     has_es = any(m.lower() in text for m in ES_MARKERS)
     has_lat = any(m.lower() in text for m in LATIN_MARKERS)
     has_other = any(m.lower() in text for m in OTHER_MARKERS)
+
+    # Marcadores dudosos tipo "🇪🇸?" no cuentan como castellano confirmado.
+    if "🇪🇸?" in text and not re.search(r"castellano|español|espanol|vo\.es|es-es", text):
+        return "LATINO" if has_lat else "SIN_MARCADOR"
 
     # Trampas: "spanish latino", "castellano latino"
     if has_lat and has_es:
@@ -390,12 +421,14 @@ def _dedup_key(stream: Dict[str, Any]) -> str:
     url = stream.get("url")
     if url:
         return f"url:{str(url)[:200]}"
-    title = re.sub(r"\s+", " ", (stream.get("title", "") or "")).strip().lower()
+    title = stream.get("title") or stream.get("description") or ""
+    title = re.sub(r"\s+", " ", title).strip().lower()
     return f"title:{title[:160]}"
 
 
 def build_rankings(
     raw: List[Tuple[str, Dict[str, Any]]],
+    media_type: str = "movie",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Filtra a castellano, deduplica y ordena de mejor a peor.
@@ -410,7 +443,16 @@ def build_rankings(
             stats[lang] = stats.get(lang, 0) + 1
             continue
 
-        title = stream.get("title", "") or ""
+        title = stream.get("title") or stream.get("description") or ""
+
+        # LatinoBox mezcla packs de temporada en resultados de episodio.
+        if media_type == "series" and re.search(
+            r"temporadas?|season|serie completa|cap[ií]tulos? complet|\bs\d{1,2}\s*(?:-|a)\s*s?\d{1,2}\b",
+            title, re.IGNORECASE,
+        ):
+            stats["pack_temporada"] = stats.get("pack_temporada", 0) + 1
+            continue
+
         score, label = classify_quality(title)
         if score < MIN_QUALITY_SCORE:
             stats["calidad_baja"] = stats.get("calidad_baja", 0) + 1
@@ -581,7 +623,7 @@ def _magnet_is_ready(mag: Dict[str, Any]) -> bool:
         return str(mag.get("status", "")).lower() == "ready"
 
 
-def _make_direct_stream(stream: Dict[str, Any], direct_url: str) -> Dict[str, Any]:
+def _make_direct_stream(stream: Dict[str, Any], direct_url: str, tag: str = "[CACHE]") -> Dict[str, Any]:
     """
     Construye el stream final SIN campos P2P.
 
@@ -589,8 +631,8 @@ def _make_direct_stream(stream: Dict[str, Any], direct_url: str) -> Dict[str, An
     `behaviorHints.bingeGroup`. El unico campo de reproduccion es `url`.
     """
     name = stream.get("name", "") or "Stream"
-    if "[CACHE]" not in name:
-        name = f"{name} [CACHE]"
+    if tag not in name:
+        name = f"{name} {tag}"
     return {
         "name": name,
         "title": stream.get("title", "") or "",
@@ -621,7 +663,8 @@ def convert_to_direct_links(streams: List[Dict[str, Any]], key: str) -> List[Dic
     def worker(idx: int, stream: Dict[str, Any]) -> None:
         # Algunas fuentes ya entregan URL directa: la aprovechamos tal cual.
         if stream.get("url") and not stream.get("infoHash"):
-            results[idx] = _make_direct_stream(stream, stream["url"])
+            # Enlace directo propio de la fuente (DeepFlix): no es cache AllDebrid.
+            results[idx] = _make_direct_stream(stream, stream["url"], "[DIRECTO]")
             return
 
         hash_ = stream.get("infoHash")
@@ -710,7 +753,7 @@ def build_streams(
         return cached
 
     raw, errors = fetch_all_sources(media_type, full_id, alldebrid_key, enabled_sources)
-    ranked, _ = build_rankings(raw)
+    ranked, _ = build_rankings(raw, media_type)
 
     if not alldebrid_key:
         print("[WARN] Sin API key de AllDebrid: este addon solo sirve enlaces cacheados")
@@ -793,9 +836,10 @@ CONFIGURE_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <h1>{name}</h1>
-<p>Este addon consulta <strong>4 fuentes en paralelo</strong>, devuelve solo castellano espanol
+<p>Este addon consulta <strong>5 fuentes en paralelo</strong>, devuelve solo castellano espanol
 y <strong style="color:#7fe3a8">exclusivamente enlaces directos YA CACHEADOS en AllDebrid</strong>.
-No se devuelve ningun magnet ni enlace P2P: si un torrent no esta en la cache de AllDebrid, se descarta.</p>
+No se devuelve ningun magnet ni enlace P2P: si un torrent no esta en la cache de AllDebrid, se descarta.
+Las fuentes de enlace directo propio que no garantizan cache (por ejemplo DeepFlix) no se incluyen.</p>
 
 <h2>Fuentes activas</h2>
 {sources}
