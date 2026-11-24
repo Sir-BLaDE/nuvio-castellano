@@ -53,7 +53,7 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 # =====================================================
 
 ADDON_ID = "com.sirblade.nuvio-castellano"
-ADDON_VERSION = "3.2.1"
+ADDON_VERSION = "3.2.2"
 ADDON_NAME = "Castellano ES - SOLO CACHE (Nuvio)"
 ADDON_DESCRIPTION = (
     "Agrega Spanish Streams + Torrentio(ES) + Peerflix + Pipe + LatinoBox-ES "
@@ -376,7 +376,8 @@ def classify_language(stream: Dict[str, Any]) -> str:
     if ambiguo and not re.search(r"castellano|español|espanol|vo\.es|es-es", text):
         return "LATINO" if has_lat else "SIN_MARCADOR"
 
-    # Trampas: "spanish latino", "castellano latino"
+    # Audio dual castellano+latino: se mantiene pero se ordena despues del
+    # castellano puro (no es lo que se ve en el nombre de LatinoBox-ES).
     if has_lat and has_es:
         return "CASTELLANO_DUAL"
     if has_es:
@@ -392,35 +393,62 @@ def classify_language(stream: Dict[str, Any]) -> str:
 # CLASIFICACION DETALLADA DE CALIDAD
 # =====================================================
 
-QUALITY_RULES: List[Tuple[str, int, str]] = [
-    (r"2160p.*remux|remux.*2160p|uhd.*remux|remux.*uhd", 100, "4K UHD REMUX"),
-    (r"2160p.*blu ?ray|blu ?ray.*2160p|uhd.*blu ?ray", 95, "4K UHD BluRay"),
-    (r"2160p.*web-?dl|web-?dl.*2160p|4k.*web-?dl", 90, "4K WEB-DL"),
-    (r"2160p|4k|uhd", 85, "4K UHD"),
-    (r"1080p.*remux|remux.*1080p|bdremux.*1080", 80, "1080p REMUX"),
-    (r"1080p.*blu ?ray|blu ?ray.*1080p|bdrip.*1080|bdremux", 75, "1080p BluRay"),
-    (r"1080p.*web-?dl|web-?dl.*1080p|webdl.*1080", 70, "1080p WEB-DL"),
-    (r"1080p.*hdtv|hdtv.*1080p", 65, "1080p HDTV"),
-    (r"1080p", 60, "1080p"),
-    (r"720p.*blu ?ray|blu ?ray.*720p", 55, "720p BluRay"),
-    (r"720p.*web-?dl|web-?dl.*720p", 50, "720p WEB-DL"),
-    (r"720p.*hdtv|hdtv.*720p", 45, "720p HDTV"),
-    (r"720p", 40, "720p"),
-    (r"480p|576p", 30, "SD 480p"),
-    (r"dvd ?rip|dvdrip", 25, "DVD Rip"),
-    (r"hdtv|tvrip", 20, "SD TV"),
-    (r"\bcam\b|\bts\b|screener", 10, "CAM/TS"),
-]
+# La resolucion se lee SOLO de marcadores explicitos (palabra completa).
+# "4Kreescalado", "4kids" o una etiqueta del proveedor no cuentan como 4K si
+# el fichero dice 720p/480p.
+_RESOLUTION_SCORES = {
+    2160: 85, 1080: 60, 720: 40, 576: 30, 480: 30,
+}
+_TYPE_SCORES = {
+    "REMUX": 15, "BluRay": 10, "WEB-DL": 5, "HDTV": 5,
+    "DVD Rip": -5, "CAM/TS": -30, "": 0,
+}
+_TYPE_LABEL = {
+    "REMUX": "REMUX", "BluRay": "BluRay", "WEB-DL": "WEB-DL",
+    "HDTV": "HDTV", "DVD Rip": "DVD Rip", "CAM/TS": "CAM/TS", "": "",
+}
+
+
+def _detect_resolution(t: str) -> int:
+    explicit = [int(x[:-1]) for x in re.findall(r"\b(2160p|1080p|720p|576p|480p)\b", t)]
+    if explicit:
+        return max(explicit)
+    if re.search(r"\b(4k|uhd)\b", t):
+        return 2160
+    return 0
+
+
+def _detect_type(t: str) -> str:
+    if re.search(r"remux", t):
+        return "REMUX"
+    if re.search(r"blu ?ray|bluray|bdrip|brrip", t):
+        return "BluRay"
+    if re.search(r"web-?dl|webdl", t):
+        return "WEB-DL"
+    if re.search(r"hdtv|tvrip", t):
+        return "HDTV"
+    if re.search(r"dvd ?rip|dvdrip", t):
+        return "DVD Rip"
+    if re.search(r"\bcam\b|\bts\b|screener", t):
+        return "CAM/TS"
+    return ""
 
 
 def classify_quality(title: str) -> Tuple[int, str]:
-    """Devuelve (score, etiqueta). Mayor score = mejor calidad."""
+    """Devuelve (score, etiqueta) usando la resolucion REAL del fichero."""
     t = (title or "").lower()
-    score, label = 0, "DESCONOCIDA"
-    for pattern, s, l in QUALITY_RULES:
-        if re.search(pattern, t):
-            score, label = s, l
-            break
+    res = _detect_resolution(t)
+    kind = _detect_type(t)
+
+    if res:
+        res_txt = "4K UHD" if res == 2160 else f"{res}p"
+        score = _RESOLUTION_SCORES[res] + _TYPE_SCORES[kind]
+        label = f"{res_txt} {_TYPE_LABEL[kind]}".strip()
+    elif kind in ("DVD Rip", "CAM/TS"):
+        score, label = (25, "DVD Rip") if kind == "DVD Rip" else (10, "CAM/TS")
+    else:
+        score, label = 0, "DESCONOCIDA"
+
     bonus = 0
     if re.search(r"\bhdr10\b|\bhdr\b|dolby vision|\bdv\b", t):
         bonus += 3
@@ -579,11 +607,12 @@ def build_rankings(
             stats["pack_temporada"] = stats.get("pack_temporada", 0) + 1
             continue
 
-        # Algunas fuentes (TorrentClaw/Meteor/Comet) ponen la resolucion en
-        # `name`, no en `title`: clasificamos con ambos campos.
-        score, label = classify_quality(
-            f"{stream.get('name', '') or ''} {title}"
-        )
+        # La resolucion real del fichero esta en `title`. Solo si no se puede
+        # determinar se mira `name` (TorrentClaw/Meteor/Comet la ponen ahi).
+        # Asi un "4K" de etiqueta nunca gana a un "720p" real del titulo.
+        score, label = classify_quality(title)
+        if score == 0 and label == "DESCONOCIDA":
+            score, label = classify_quality(stream.get("name", "") or "")
         if score < MIN_QUALITY_SCORE:
             stats["calidad_baja"] = stats.get("calidad_baja", 0) + 1
             continue
@@ -616,9 +645,10 @@ def build_rankings(
         fuentes = " + ".join(sorted(c["sources"]))
         lang_txt = LANG_LABEL[c["lang"]]
         s["name"] = f"#{rank} {lang_txt} | {c['label']} | {fuentes}"
+        original_title = c["stream"].get("title") or c["stream"].get("description") or ""
         s["title"] = (
             f"[ES] {c['label']} · score {c['score']} · 👤{c['seeds']} · "
-            f"💾{c['size']:.1f}GB · {fuentes}\n{title}"
+            f"💾{c['size']:.1f}GB · {fuentes}\n{original_title}"
         )
         result.append(s)
 
