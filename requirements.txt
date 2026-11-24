@@ -1,0 +1,2 @@
+# El addon usa solo la librería estándar de Python.
+# Archivo presente para que el buildpack de Python de Beamup/Render lo detecte.

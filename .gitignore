@@ -1,0 +1,8 @@
+id_ed25519_beamup
+id_ed25519_beamup.pub
+cache/
+__pycache__/
+*.pyc
+*.log
+beamup.json
+beamup-config.json
