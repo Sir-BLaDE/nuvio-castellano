@@ -53,7 +53,7 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 # =====================================================
 
 ADDON_ID = "com.sirblade.nuvio-castellano"
-ADDON_VERSION = "3.2.2"
+ADDON_VERSION = "3.2.3"
 ADDON_NAME = "Castellano ES - SOLO CACHE (Nuvio)"
 ADDON_DESCRIPTION = (
     "Agrega Spanish Streams + Torrentio(ES) + Peerflix + Pipe + LatinoBox-ES "
@@ -831,7 +831,7 @@ def convert_to_direct_links(streams: List[Dict[str, Any]], key: str) -> List[Dic
         if not hash_:
             return
 
-        cache_key = f"{fp}:{hash_}:{stream.get('fileIdx', 'x')}"
+        cache_key = f"v{ADDON_VERSION}:{fp}:{hash_}:{stream.get('fileIdx', 'x')}"
         cached = _cache_get(DIRECT_CACHE_FILE, cache_key, DIRECT_CACHE_TTL)
         if cached:
             results[idx] = _make_direct_stream(stream, cached)
@@ -905,7 +905,8 @@ def build_streams(
     enabled_sources: List[str],
 ) -> List[Dict[str, Any]]:
     fp = _fingerprint(alldebrid_key)
-    cache_key = f"{media_type}|{full_id}|{','.join(enabled_sources)}|{fp}"
+    # La version invalida la cache al desplegar: Nuvio no necesita re-instalar.
+    cache_key = f"v{ADDON_VERSION}|{media_type}|{full_id}|{','.join(enabled_sources)}|{fp}"
 
     cached = _cache_get(STREAM_CACHE_FILE, cache_key, STREAM_CACHE_TTL)
     if cached is not None:
@@ -1165,7 +1166,7 @@ class NuvioAddonHandler(BaseHTTPRequestHandler):
             self._send_json({
                 "status": "ok", "addon": ADDON_NAME, "version": ADDON_VERSION,
                 "configure": "/configure", "sources": list(SOURCES.keys()),
-            })
+            }, cache=False)
             return
 
         # --- Config y manifiesto ---
@@ -1174,13 +1175,13 @@ class NuvioAddonHandler(BaseHTTPRequestHandler):
         enabled = [s for s in cfg.get("sources", []) if s in SOURCES] or DEFAULT_SOURCES
 
         if path.endswith("/manifest.json") or path == "/manifest.json":
-            self._send_json(build_manifest())
+            self._send_json(build_manifest(), cache=False)
             return
 
         # Algunos clientes piden el manifiesto a la URL base del config, sin
         # /manifest.json. Aceptamos /{config} y /{config}/ por compatibilidad.
         if re.fullmatch(r"/[^/]+/?", path) and decode_config(path.strip("/")):
-            self._send_json(build_manifest())
+            self._send_json(build_manifest(), cache=False)
             return
 
         # --- Streams ---
@@ -1192,10 +1193,10 @@ class NuvioAddonHandler(BaseHTTPRequestHandler):
             raw_id = urllib.parse.unquote(raw_id)
             print(f"[INFO] Stream {media_type} {raw_id} | fuentes={enabled}")
             streams = build_streams(media_type, raw_id, alldebrid_key, enabled)
-            self._send_json({"streams": streams})
+            self._send_json({"streams": streams}, cache=False)
             return
 
-        self._send_json({"error": "Not found", "path": path}, status=404)
+        self._send_json({"error": "Not found", "path": path}, status=404, cache=False)
 
 
 def run_server(host: str = HOST, port: int = PORT) -> None:
