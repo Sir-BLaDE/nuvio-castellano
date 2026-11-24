@@ -16,9 +16,13 @@ FUENTES que consulta en paralelo:
   3. Peerflix         - la que ya tienes instalada
   4. Pipe             - scraping adicional de indices
   5. LatinoBox-ES     - configurado con langMode=only_castellano
+  6. TorrentClaw      - modo INSTANT + AllDebrid (URL que redirige a debrid.it)
+  7. Comet (ElfHosted)- cachedOnly + AllDebrid, solo marcas [AD⚡]
 
-DeepFlix se descarto: devuelve un enlace directo propio (no cache AllDebrid)
-y marca el idioma como "🇪🇸?" (ambiguo), por lo que no cumple el modo estricto.
+Descartadas tras investigacion: DeepFlix (directo propio, idioma "🇪🇸?" ambiguo),
+Meteor (no distingue castellano de latino), TorrentsDB (sin marcadores de idioma
+y sus enlaces son "AD download", no INSTANT) y AnimES/AnimeES (HTTP propio,
+sin cache AllDebrid).
 
 Pipeline:
   Consulta paralela -> filtro CASTELLANO (descarta latino/otros) ->
@@ -49,13 +53,13 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 # =====================================================
 
 ADDON_ID = "com.sirblade.nuvio-castellano"
-ADDON_VERSION = "3.1.0"
+ADDON_VERSION = "3.2.0"
 ADDON_NAME = "Castellano ES - SOLO CACHE (Nuvio)"
 ADDON_DESCRIPTION = (
-    "Agrega Spanish Streams + Torrentio(ES) + Peerflix + Pipe + LatinoBox-ES. "
-    "SOLO castellano espanol (descarta latino/otros idiomas) y SOLO enlaces "
-    "directos YA CACHEADOS en AllDebrid: cero magnets/P2P. "
-    "Ordenados por calidad: Remux > BluRay > WEB-DL > HDTV."
+    "Agrega Spanish Streams + Torrentio(ES) + Peerflix + Pipe + LatinoBox-ES "
+    "+ TorrentClaw + Comet. SOLO castellano espanol (descarta latino/otros "
+    "idiomas) y SOLO enlaces directos YA CACHEADOS en AllDebrid: cero "
+    "magnets/P2P. Ordenados por calidad: Remux > BluRay > WEB-DL > HDTV."
 )
 
 HOST = "0.0.0.0"
@@ -112,6 +116,74 @@ def _latinobox_config(lang_mode: str = "only_castellano") -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+_TC_CONFIG_CACHE: Dict[str, str] = {}
+
+
+def _torrentclaw_base(key: str, timeout: int = 12) -> str:
+    """
+    Construye (una vez por key) la URL cifrada de TorrentClaw con AllDebrid.
+    El token de debrid queda cifrado en el servidor de TorrentClaw: no viaja
+    en claro en la URL publica del addon.
+    """
+    fp = _fingerprint(key)
+    if fp in _TC_CONFIG_CACHE:
+        return _TC_CONFIG_CACHE[fp]
+
+    body = {
+        "prefs": {
+            "lang": "es-ES",
+            "langHard": True,
+            "langOnly": True,
+            "vo": True,
+            "noP2P": True,
+            "noDebrid": False,
+            "noUnarr": True,
+            "noCatalogs": True,
+            "sort": "score",
+        },
+        "debrid": {"provider": "alldebrid", "token": key},
+    }
+    req = urllib.request.Request(
+        "https://torrentclaw.com/api/stremio/configure/build",
+        data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "User-Agent": f"{ALLDEBRID_AGENT}/2.0"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    manifest = data.get("manifestUrl", "")
+    suffix = "/manifest.json"
+    if not manifest.endswith(suffix):
+        raise ValueError("TorrentClaw no devolvio manifestUrl")
+    base = manifest[: -len(suffix)]
+    _TC_CONFIG_CACHE[fp] = base
+    return base
+
+
+def _comet_base(key: str) -> str:
+    """Config de Comet: cachedOnly + AllDebrid + idioma es (base64 estandar)."""
+    settings = {
+        "debridServices": [{"service": "alldebrid", "apiKey": key}],
+        "enableTorrent": False,
+        "cachedOnly": True,
+        "deduplicateStreams": True,
+        "languages": {"required": ["es"], "allowed": ["es"], "exclude": [], "preferred": ["es"]},
+        "options": {
+            "remove_ranks_under": 0,
+            "allow_english_in_languages": False,
+            "remove_unknown_languages": True,
+        },
+        "resultFormat": ["all"],
+    }
+    for sep in ((",", ":"), (", ", ": "), (",", ": ")):
+        raw = json.dumps(settings, separators=sep).encode("utf-8")
+        b64 = base64.b64encode(raw).decode("ascii")
+        if "/" not in b64:  # '/' romperia el path del addon
+            return f"https://comet.elfhosted.com/{b64}"
+    raise ValueError("No se pudo codificar la configuracion de Comet sin '/'")
+
+
 SOURCES: Dict[str, Dict[str, Any]] = {
     "spanishstreams": {
         "label": "SpanishStreams",
@@ -151,6 +223,18 @@ SOURCES: Dict[str, Dict[str, Any]] = {
         "build": lambda t, i, k: (
             f"https://latinobox.daleplay.biz/c/{_latinobox_config()}"
             f"/stream/{t}/{urllib.parse.quote(i, safe=':')}.json"
+        ),
+    },
+    "torrentclaw": {
+        "label": "TorrentClaw-AD",
+        "build": lambda t, i, k: (
+            f"{_torrentclaw_base(k)}/stream/{t}/{urllib.parse.quote(i, safe=':')}.json"
+        ),
+    },
+    "comet": {
+        "label": "Comet-AD",
+        "build": lambda t, i, k: (
+            f"{_comet_base(k)}/stream/{t}/{urllib.parse.quote(i, safe=':')}.json"
         ),
     },
 }
@@ -261,7 +345,7 @@ def classify_language(stream: Dict[str, Any]) -> str:
     """
     title = stream.get("title", "") or ""
     name = stream.get("name", "") or ""
-    desc = stream.get("description", "") or ""   # DeepFlix usa 'description'
+    desc = stream.get("description", "") or ""   # Meteor/AnimES usan 'description'
     group = ""
     try:
         group = stream.get("behaviorHints", {}).get("bingeGroup", "") or ""
@@ -282,8 +366,9 @@ def classify_language(stream: Dict[str, Any]) -> str:
     has_lat = any(m.lower() in text for m in LATIN_MARKERS)
     has_other = any(m.lower() in text for m in OTHER_MARKERS)
 
-    # Marcadores dudosos tipo "🇪🇸?" no cuentan como castellano confirmado.
-    if "🇪🇸?" in text and not re.search(r"castellano|español|espanol|vo\.es|es-es", text):
+    # Marcadores dudosos tipo "🇪🇸?" / "ES?" no cuentan como castellano confirmado.
+    ambiguo = ("🇪🇸?" in text) or bool(re.search(r"\bes\?", text))
+    if ambiguo and not re.search(r"castellano|español|espanol|vo\.es|es-es", text):
         return "LATINO" if has_lat else "SIN_MARCADOR"
 
     # Trampas: "spanish latino", "castellano latino"
@@ -319,7 +404,7 @@ QUALITY_RULES: List[Tuple[str, int, str]] = [
     (r"480p|576p", 30, "SD 480p"),
     (r"dvd ?rip|dvdrip", 25, "DVD Rip"),
     (r"hdtv|tvrip", 20, "SD TV"),
-    (r"cam|ts|screener", 10, "CAM/TS"),
+    (r"\bcam\b|\bts\b|screener", 10, "CAM/TS"),
 ]
 
 
@@ -375,6 +460,34 @@ def _fetch_source(source_id: str, url: str, timeout: int = 18) -> Tuple[str, Lis
         return source_id, [], str(e)
 
 
+def _filter_cached_direct(source_id: str, streams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Las fuentes que ya entregan URL propia solo se aceptan si ellas mismas
+    garantizan cache AllDebrid (INSTANT / [AD⚡]). El resto se descarta.
+    """
+    kept: List[Dict[str, Any]] = []
+    for raw in streams:
+        if not isinstance(raw, dict):
+            continue
+        s = dict(raw)
+        if source_id == "torrentclaw":
+            name = s.get("name", "") or ""
+            title = s.get("title", "") or ""
+            if (
+                "INSTANT" not in name.upper()
+                or "AD" not in title.upper()
+                or "caches on play" in title.lower()
+            ):
+                continue
+            s["_verified_cached"] = True
+        elif source_id == "comet":
+            if not (s.get("name", "") or "").startswith("[AD⚡]"):
+                continue
+            s["_verified_cached"] = True
+        kept.append(s)
+    return kept
+
+
 def fetch_all_sources(
     media_type: str,
     full_id: str,
@@ -403,10 +516,10 @@ def fetch_all_sources(
                 errors[sid] = err
                 print(f"[WARN] Fuente {sid} fallo: {err}")
             else:
-                print(f"[INFO] Fuente {sid}: {len(streams)} streams")
-                for s in streams:
-                    if isinstance(s, dict):
-                        collected.append((sid, s))
+                kept = _filter_cached_direct(sid, streams)
+                print(f"[INFO] Fuente {sid}: {len(kept)}/{len(streams)} streams (cacheados)")
+                for s in kept:
+                    collected.append((sid, s))
     return collected, errors
 
 
@@ -445,6 +558,14 @@ def build_rankings(
 
         title = stream.get("title") or stream.get("description") or ""
 
+        # Comet solo etiqueta "es" generico: exigimos CASTELLANO explicito
+        # en el nombre del fichero para no colar latino.
+        if source_id == "comet" and not re.search(
+            r"castellano|es-es|vo\.es", title, re.IGNORECASE
+        ):
+            stats["comet_sin_castellano"] = stats.get("comet_sin_castellano", 0) + 1
+            continue
+
         # LatinoBox mezcla packs de temporada en resultados de episodio.
         if media_type == "series" and re.search(
             r"temporadas?|season|serie completa|cap[ií]tulos? complet|\bs\d{1,2}\s*(?:-|a)\s*s?\d{1,2}\b",
@@ -453,7 +574,11 @@ def build_rankings(
             stats["pack_temporada"] = stats.get("pack_temporada", 0) + 1
             continue
 
-        score, label = classify_quality(title)
+        # Algunas fuentes (TorrentClaw/Meteor/Comet) ponen la resolucion en
+        # `name`, no en `title`: clasificamos con ambos campos.
+        score, label = classify_quality(
+            f"{stream.get('name', '') or ''} {title}"
+        )
         if score < MIN_QUALITY_SCORE:
             stats["calidad_baja"] = stats.get("calidad_baja", 0) + 1
             continue
@@ -488,7 +613,7 @@ def build_rankings(
         s["name"] = f"#{rank} {lang_txt} | {c['label']} | {fuentes}"
         s["title"] = (
             f"[ES] {c['label']} · score {c['score']} · 👤{c['seeds']} · "
-            f"💾{c['size']:.1f}GB · {fuentes}\n{(s.get('title') or '')}"
+            f"💾{c['size']:.1f}GB · {fuentes}\n{title}"
         )
         result.append(s)
 
@@ -661,10 +786,10 @@ def convert_to_direct_links(streams: List[Dict[str, Any]], key: str) -> List[Dic
     new_cache: List[Tuple[str, str]] = []
 
     def worker(idx: int, stream: Dict[str, Any]) -> None:
-        # Algunas fuentes ya entregan URL directa: la aprovechamos tal cual.
+        # Algunas fuentes ya entregan URL directa cacheada (TorrentClaw/Comet).
         if stream.get("url") and not stream.get("infoHash"):
-            # Enlace directo propio de la fuente (DeepFlix): no es cache AllDebrid.
-            results[idx] = _make_direct_stream(stream, stream["url"], "[DIRECTO]")
+            tag = "[CACHE-AD]" if stream.get("_verified_cached") else "[DIRECTO]"
+            results[idx] = _make_direct_stream(stream, stream["url"], tag)
             return
 
         hash_ = stream.get("infoHash")
@@ -836,10 +961,10 @@ CONFIGURE_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <h1>{name}</h1>
-<p>Este addon consulta <strong>5 fuentes en paralelo</strong>, devuelve solo castellano espanol
+<p>Este addon consulta <strong>7 fuentes en paralelo</strong>, devuelve solo castellano espanol
 y <strong style="color:#7fe3a8">exclusivamente enlaces directos YA CACHEADOS en AllDebrid</strong>.
 No se devuelve ningun magnet ni enlace P2P: si un torrent no esta en la cache de AllDebrid, se descarta.
-Las fuentes de enlace directo propio que no garantizan cache (por ejemplo DeepFlix) no se incluyen.</p>
+TorrentClaw y Comet solo se aceptan en modo INSTANT/[AD⚡]; DeepFlix, Meteor, TorrentsDB y AnimES quedan fuera.</p>
 
 <h2>Fuentes activas</h2>
 {sources}
